@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# lfsctl — CLI da suíte LFS/BLFS
+set -euo pipefail
+
+: "${LFS_RUNTIME:=/usr/local/lib/lfs}"
+# shellcheck source=/usr/local/lib/lfs/common.sh
+. "${LFS_RUNTIME}/common.sh"
+
+VERSION="1.0.0"
+
+usage() {
+  cat <<USAGE
+lfsctl ${VERSION}
+Uso: lfsctl <comando> [opções]
+
+Comandos estáveis (Módulo 1):
+  version                     Mostra versão
+  init                        Cria diretórios padrão e config inicial
+  doctor                      Verifica dependências do ambiente
+  status                      Mostra resumo de configuração/paths
+  logs [N]                    Mostra as últimas N linhas de log (default 200)
+  log-demo                    Gera entradas de log de teste
+  lock test [NAME]            Testa aquisição de lock (default: example)
+  config print                Exibe config efetiva
+  config set KEY=VAL [...]    Atualiza/insere chaves no /etc/lfs/config
+
+Opções globais (via env ou config):
+  LFS_VERBOSE=0..3, LFS_COLOR=auto|always|never, LFS_MAX_JOBS, LFS_MAX_FETCH, ...
+
+Exemplos:
+  sudo lfsctl init
+  lfsctl doctor
+  lfsctl status
+  lfsctl logs 500
+  lfsctl lock test builder
+  sudo lfsctl config set LFS_MAX_JOBS=8 LFS_COLOR=always
+USAGE
+}
+
+cmd_version() {
+  echo "lfsctl ${VERSION}"
+}
+
+cmd_init() {
+  assert_root
+  log_info "Inicializando diretórios e configuração..."
+  bootstrap_runtime
+  log_ok "Config principal: ${LFS_DEFAULT_CONFIG_FILE}"
+  log_ok "Diretórios criados:"
+  print_env_summary | sed 's/^/  - /'
+}
+
+cmd_doctor() {
+  bootstrap_runtime
+  log_info "Verificando dependências..."
+  if doctor_checks; then
+    log_ok "Ambiente OK."
+  else
+    log_error "Existem dependências faltantes."
+    exit 2
+  fi
+}
+
+cmd_status() {
+  bootstrap_runtime
+  echo "== STATUS =="
+  print_env_summary
+  echo
+  echo "Locks em: ${LFS_LOCK_DIR}"
+  echo "Banco de dados: ${LFS_DB_DIR}"
+  echo "Receitas: ${LFS_RECIPES_DIR}"
+  echo "Logs: ${LFS_LOG_FILE}"
+  echo
+  if mount | grep -q "/mnt/lfs"; then
+    echo "Montagem /mnt/lfs detectada:"
+    mount | grep "/mnt/lfs" | sed 's/^/  /'
+  else
+    echo "Sem montagem /mnt/lfs ativa."
+  fi
+}
+
+cmd_logs() {
+  bootstrap_runtime
+  local n="${1:-200}"
+  tail_logs "${n}"
+}
+
+cmd_log_demo() {
+  bootstrap_runtime
+  log_info "Mensagem informativa"
+  log_ok   "Operação concluída"
+  log_warn "Atenção: exemplo"
+  log_error "Erro simulado (não crítico)"
+  log_debug "Debug somente com LFS_VERBOSE=3"
+  echo "Gerado no log: ${LFS_LOG_FILE}"
+}
+
+cmd_lock_test() {
+  bootstrap_runtime
+  local name="${1:-example}"
+  log_info "Testando lock '${name}' por 3 segundos..."
+  with_flock "${name}" 5 bash -c 'sleep 3'
+  log_ok "Lock '${name}' adquirido e liberado com sucesso."
+}
+
+cmd_config_print() {
+  bootstrap_runtime
+  echo "# Config efetiva (após /etc/lfs/config e *.conf)"
+  print_env_summary
+  echo
+  echo "# Arquivos:"
+  echo "  - ${LFS_DEFAULT_CONFIG_FILE}"
+  if compgen -G "${LFS_ETC_D}/*.conf" >/dev/null; then
+    for cf in "${LFS_ETC_D}"/*.conf; do
+      echo "  - ${cf}"
+    done
+  else
+    echo "  - (sem overrides em ${LFS_ETC_D})"
+  fi
+}
+
+cmd_config_set() {
+  assert_root
+  bootstrap_runtime
+  [[ "$#" -ge 1 ]] || die 2 "Uso: lfsctl config set KEY=VAL [KEY=VAL...]"
+  local kv
+  touch "${LFS_DEFAULT_CONFIG_FILE}"
+  chmod 0644 "${LFS_DEFAULT_CONFIG_FILE}"
+  for kv in "$@"; do
+    if [[ ! "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      die 2 "Par inválido: ${kv}. Use KEY=VAL"
+    fi
+    local key="${kv%%=*}"
+    local val="${kv#*=}"
+    if grep -qE "^${key}=" "${LFS_DEFAULT_CONFIG_FILE}"; then
+      sed -i -E "s|^${key}=.*|${key}=${val}|g" "${LFS_DEFAULT_CONFIG_FILE}"
+      log_ok "Atualizado: ${key}=${val}"
+    else
+      echo "${key}=${val}" >> "${LFS_DEFAULT_CONFIG_FILE}"
+      log_ok "Inserido: ${key}=${val}"
+    fi
+  done
+}
+
+#=====================
+# Dispatcher
+#=====================
+main() {
+  local cmd="${1:-}"; shift || true
+  case "${cmd}" in
+    ""|-h|--help|help) usage ;;
+    version)           cmd_version ;;
+    init)              cmd_init ;;
+    doctor)            cmd_doctor ;;
+    status)            cmd_status ;;
+    logs)              cmd_logs "${1:-}" ;;
+    log-demo|logdemo)  cmd_log_demo ;;
+    lock)
+      case "${1:-}" in
+        test) shift; cmd_lock_test "${1:-example}" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    config)
+      case "${1:-}" in
+        print) shift; cmd_config_print ;;
+        set)   shift; cmd_config_set "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    *)
+      log_error "Comando desconhecido: ${cmd}"
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
