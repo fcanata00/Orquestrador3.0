@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # lfsctl — CLI unificado (Módulos 1..7) + program search/info + atalhos (-i/--install)
-# Versão: 1.8.0
+# Versão: 1.0.0
 # Instale em /usr/local/bin/lfsctl (chmod 0755)
+# Para habilitar busca no repositório export LFS_RECIPES_GIT_DIR=/caminho/para/seu/repo/receitas
 
 set -euo pipefail
 
