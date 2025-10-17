@@ -6,6 +6,8 @@ set -euo pipefail
 
 : "${LFS_RUNTIME:=/usr/local/lib/lfs}"
 # shellcheck source=/usr/local/lib/lfs/common.sh
+. "${LFS_RUNTIME}/packager.sh"
+# shellcheck source=/usr/local/lib/lfs/packager.sh
 . "${LFS_RUNTIME}/common.sh"
 # shellcheck source=/usr/local/lib/lfs/downloader.sh
 . "${LFS_RUNTIME}/downloader.sh"
@@ -330,10 +332,15 @@ build_one() {
   fi
 
   _write_meta "${name}" "${dest}"
+
+  # Cria pacote .tar.zst automaticamente após build (produção)
+  local pkg
+  pkg="$(package_create "${NAME}" "${VERSION}" "${EPOCH}" "${RELEASE}" "${dest}")"
+  log_info "Pacote gerado: ${pkg}"
+
   rm -rf "${bdir}"
   log_ok "Build OK: ${name}-${VERSION}"
 }
-
 #-----------------------------
 # Build com resolução de dependências
 #-----------------------------
