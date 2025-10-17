@@ -155,6 +155,23 @@ Exemplos:
    lfsctl program search openssl
    lfsctl program info gcc
 
+# (no host ou dentro do chroot, conforme seu fluxo)
+sudo lfsctl build lfs-bootscripts
+sudo lfsctl pkg create lfs-bootscripts
+sudo lfsctl -i /var/lib/lfs/packages/lfs-bootscripts-20240701-1.tar.zst
+
+sudo lfsctl build network-scripts
+sudo lfsctl pkg create network-scripts
+sudo lfsctl -i /var/lib/lfs/packages/network-scripts-1.0-1.tar.zst
+
+sudo lfsctl build shadow-config
+sudo lfsctl pkg create shadow-config
+sudo lfsctl -i /var/lib/lfs/packages/shadow-config-1.0-1.tar.zst
+
+sudo lfsctl build bashrc-lfs
+sudo lfsctl pkg create bashrc-lfs
+sudo lfsctl -i /var/lib/lfs/packages/bashrc-lfs-1.0-1.tar.zst
+
 
 6. VARIÁVEIS DE AMBIENTE GLOBAIS
 --------------------------------
