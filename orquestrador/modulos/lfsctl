@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lfsctl — CLI da suíte LFS/BLFS (Módulo 1 + 2)
+# lfsctl — CLI da suíte LFS/BLFS (Módulo 1 + 2 + 3)
 set -euo pipefail
 
 : "${LFS_RUNTIME:=/usr/local/lib/lfs}"
@@ -7,26 +7,28 @@ set -euo pipefail
 . "${LFS_RUNTIME}/common.sh"
 # shellcheck source=/usr/local/lib/lfs/downloader.sh
 . "${LFS_RUNTIME}/downloader.sh"
+# shellcheck source=/usr/local/lib/lfs/chroot.sh
+. "${LFS_RUNTIME}/chroot.sh"
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 usage() {
   cat <<'USAGE'
-lfsctl 1.1.0
+lfsctl 1.2.0
 Uso: lfsctl <comando> [opções]
 
-Comandos estáveis (Módulo 1):
+Core (M1):
   version                     Mostra versão
   init                        Cria diretórios padrão e config inicial
   doctor                      Verifica dependências do ambiente
   status                      Mostra resumo de configuração/paths
-  logs [N]                    Mostra as últimas N linhas de log (default 200)
+  logs [N]                    Mostra as últimas N linhas de log
   log-demo                    Gera entradas de log de teste
-  lock test [NAME]            Testa aquisição de lock (default: example)
+  lock test [NAME]            Testa aquisição de lock
   config print                Exibe config efetiva
-  config set KEY=VAL [...]    Atualiza/insere chaves no /etc/lfs/config
+  config set KEY=VAL [...]    Atualiza/insere chaves
 
-Comandos (Módulo 2 — Downloader & Cache):
+Downloader & Cache (M2):
   fetch url <URL> --sha256 HEX [--sig SIG] [--outdir DIR] [--name FILENAME]
   fetch list <FILE> [--parallel N] [--outdir DIR]
   fetch git --url URL --ref REF --name NAME [--outdir DIR]
@@ -34,24 +36,28 @@ Comandos (Módulo 2 — Downloader & Cache):
   cache ls [sources|tarballs|git]
   cache clean [sources|tarballs|git|all]
 
-Observações:
-  - 'fetch list' aceita linhas: name|url|sha256|[sig]
-  - Mirrors podem ser configurados via LFS_MIRRORS="https://espelho1 https://espelho2"
-  - Keyring GPG em /etc/lfs/keys (ou LFS_KEYS_DIR)
+Chroot & Bootstrap (M3):
+  chroot init                 Prepara layout bootstrap em /mnt/lfs (hooks pre/post)
+  chroot mount                Monta binds (/dev, /proc, /sys, /run, /dev/pts)
+  chroot umount               Desmonta binds com segurança
+  chroot status               Mostra estado dos mounts do chroot
+  chroot enter [-- CMD...]    Entra no chroot (interativo) ou executa CMD
+  chroot exec -- CMD...       Executa comando não-interativo dentro do chroot
+  destdir run --dest DIR -- CMD...
+                              Executa comando com fakeroot e DESTDIR=DIR
 
 Exemplos:
-  sudo lfsctl init
-  lfsctl doctor
-  lfsctl fetch url https://zlib.net/zlib-1.3.1.tar.xz --sha256 deadbeef... --sig https://zlib.net/zlib-1.3.1.tar.xz.asc
-  lfsctl fetch list sources.txt --parallel 8
-  lfsctl fetch git --url https://github.com/mirror/musl --ref v1.2.5 --name musl
-  lfsctl verify /var/cache/lfs/sources/zlib-1.3.1.tar.xz --sha256 deadbeef...
-  lfsctl cache ls sources
+  sudo lfsctl chroot init
+  sudo lfsctl chroot mount
+  sudo lfsctl chroot enter
+  sudo lfsctl chroot exec -- 'echo Hello from chroot'
+  sudo lfsctl chroot umount
+  lfsctl destdir run --dest /mnt/lfs -- 'make install'
 USAGE
 }
 
 #-------------------------
-# Comandos Módulo 1 (inalterados)
+# Core (M1) — mesmos comandos
 #-------------------------
 cmd_version() { echo "lfsctl ${VERSION}"; }
 cmd_init()    { assert_root; log_info "Inicializando..."; bootstrap_runtime; log_ok "OK."; print_env_summary | sed 's/^/  - /'; }
@@ -64,115 +70,48 @@ cmd_config_print(){ bootstrap_runtime; echo "# Config efetiva"; print_env_summar
 cmd_config_set(){ assert_root; bootstrap_runtime; [[ "$#" -ge 1 ]] || die 2 "Uso: lfsctl config set KEY=VAL [...]"; local kv key val; touch "${LFS_DEFAULT_CONFIG_FILE}"; chmod 0644 "${LFS_DEFAULT_CONFIG_FILE}"; for kv in "$@"; do [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die 2 "Par inválido: ${kv}"; key="${kv%%=*}"; val="${kv#*=}"; if grep -qE "^${key}=" "${LFS_DEFAULT_CONFIG_FILE}"; then sed -i -E "s|^${key}=.*|${key}=${val}|g" "${LFS_DEFAULT_CONFIG_FILE}"; else echo "${key}=${val}" >> "${LFS_DEFAULT_CONFIG_FILE}"; fi; log_ok "${key}=${val}"; done; }
 
 #-------------------------
-# Comandos Módulo 2
+# Downloader (M2) — mesmos comandos
 #-------------------------
-cmd_fetch_url() {
-  dl_bootstrap
-  local url sha sig="" outdir="${LFS_CACHE}/sources" name=""
-  # parse args
-  [[ "${1:-}" =~ ^https?:// ]] || die 2 "Uso: lfsctl fetch url <URL> --sha256 HEX [--sig SIG] [--outdir DIR] [--name FILENAME]"
-  url="$1"; shift
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --sha256) sha="$2"; shift 2 ;;
-      --sig)    sig="$2"; shift 2 ;;
-      --outdir) outdir="$2"; shift 2 ;;
-      --name)   name="$2"; shift 2 ;;
-      *) die 2 "Parâmetro inválido: $1" ;;
-    esac
-  done
-  [[ -n "${sha:-}" ]] || die 2 "Falta --sha256"
-  local fname
-  if [[ -n "${name}" ]]; then fname="${name}"; else fname="$(basename -- "$url")"; fi
-  local out="${outdir}/${fname}"
-  with_flock "fetch" 600 bash -c '
-    dl_fetch_one "'"${fname}"'" "'"${url}"'" "'"${sha}"'" "'"${sig}"'" "'"${outdir}"'" >/dev/null
-  '
-  echo "${out}"
-}
+cmd_fetch_url() { dl_bootstrap; local url sha sig="" outdir="${LFS_CACHE}/sources" name=""; [[ "${1:-}" =~ ^https?:// ]] || die 2 "Uso: lfsctl fetch url <URL> --sha256 HEX [--sig SIG] [--outdir DIR] [--name FILENAME]"; url="$1"; shift; while [[ $# -gt 0 ]]; do case "$1" in --sha256) sha="$2"; shift 2;; --sig) sig="$2"; shift 2;; --outdir) outdir="$2"; shift 2;; --name) name="$2"; shift 2;; *) die 2 "Parâmetro inválido: $1";; esac; done; [[ -n "${sha:-}" ]] || die 2 "Falta --sha256"; local fname; if [[ -n "${name}" ]]; then fname="${name}"; else fname="$(basename -- "$url")"; fi; local out="${outdir}/${fname}"; with_flock "fetch" 600 bash -c 'dl_fetch_one "'"${fname}"'" "'"${url}"'" "'"${sha}"'" "'"${sig}"'" "'"${outdir}"'" >/dev/null'; echo "${out}"; }
+cmd_fetch_list() { dl_bootstrap; local list="${1:-}"; shift || true; [[ -n "${list}" ]] || die 2 "Uso: lfsctl fetch list <FILE> [--parallel N] [--outdir DIR]"; local parallel="$(effective_jobs)" outdir="${LFS_CACHE}/sources"; while [[ $# -gt 0 ]]; do case "$1" in --parallel) parallel="$2"; shift 2;; --outdir) outdir="$2"; shift 2;; *) die 2 "Parâmetro inválido: $1";; esac; done; with_flock "fetch" 3600 bash -c 'dl_fetch_list "'"${list}"'" "'"${outdir}"'" "'"${parallel}"'"'; }
+cmd_fetch_git() { dl_bootstrap; local url="" ref="" name="" outdir="${LFS_CACHE}/tarballs"; while [[ $# -gt 0 ]]; do case "$1" in --url) url="$2"; shift 2;; --ref) ref="$2"; shift 2;; --name) name="$2"; shift 2;; --outdir) outdir="$2"; shift 2;; *) die 2 "Uso: lfsctl fetch git --url URL --ref REF --name NAME [--outdir DIR]";; esac; done; [[ -n "${url}" && -n "${ref}" && -n "${name}" ]] || die 2 "Faltam --url/--ref/--name"; with_flock "git-archive" 3600 bash -c 'dl_git_archive --url "'"${url}"'" --ref "'"${ref}"'" --name "'"${name}"'" --outdir "'"${outdir}"'"'; }
+cmd_verify() { dl_bootstrap; local file sha sig="" keyring="${LFS_KEYS_DIR}"; [[ -n "${1:-}" ]] || die 2 "Uso: lfsctl verify <FILE> --sha256 HEX [--sig SIGFILE] [--keyring DIR]"; file="$1"; shift; while [[ $# -gt 0 ]]; do case "$1" in --sha256) sha="$2"; shift 2;; --sig) sig="$2"; shift 2;; --keyring) keyring="$2"; shift 2;; *) die 2 "Parâmetro inválido: $1";; esac; done; [[ -f "${file}" ]] || die 2 "Arquivo não encontrado: ${file}"; [[ -n "${sha:-}" ]] || die 2 "Falta --sha256"; dl_verify_sha256 "${file}" "${sha}"; [[ -n "${sig}" ]] && dl_verify_gpg "${file}" "${sig}" "${keyring}"; }
+cmd_cache_ls() { dl_bootstrap; local which="${1:-all}"; case "${which}" in all) printf "sources:\n"; ls -1 "${LFS_CACHE}/sources" 2>/dev/null || true; printf "\n tarballs:\n"; ls -1 "${LFS_CACHE}/tarballs" 2>/dev/null || true; printf "\n git:\n"; ls -1 "${LFS_CACHE}/git" 2>/dev/null || true ;; sources) ls -lh "${LFS_CACHE}/sources" 2>/dev/null || true ;; tarballs) ls -lh "${LFS_CACHE}/tarballs" 2>/dev/null || true ;; git) ls -lh "${LFS_CACHE}/git" 2>/dev/null || true ;; *) die 2 "cache ls [sources|tarballs|git|all]";; esac; }
+cmd_cache_clean() { assert_root; dl_bootstrap; local which="${1:-all}"; case "${which}" in all) rm -rf "${LFS_CACHE}/sources"/* "${LFS_CACHE}/tarballs"/* "${LFS_CACHE}/git"/* 2>/dev/null || true ;; sources) rm -rf "${LFS_CACHE}/sources"/* 2>/dev/null || true ;; tarballs) rm -rf "${LFS_CACHE}/tarballs"/* 2>/dev/null || true ;; git) rm -rf "${LFS_CACHE}/git"/* 2>/dev/null || true ;; *) die 2 "cache clean [sources|tarballs|git|all]";; esac; log_ok "Cache limpo: ${which}"; }
 
-cmd_fetch_list() {
-  dl_bootstrap
-  local list="${1:-}"; shift || true
-  [[ -n "${list}" ]] || die 2 "Uso: lfsctl fetch list <FILE> [--parallel N] [--outdir DIR]"
-  local parallel="$(effective_jobs)" outdir="${LFS_CACHE}/sources"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --parallel) parallel="$2"; shift 2 ;;
-      --outdir)   outdir="$2"; shift 2 ;;
-      *) die 2 "Parâmetro inválido: $1" ;;
-    esac
-  done
-  with_flock "fetch" 3600 bash -c '
-    dl_fetch_list "'"${list}"'" "'"${outdir}"'" "'"${parallel}"'"
-  '
+#-------------------------
+# Chroot & Bootstrap (M3)
+#-------------------------
+cmd_chroot_init()   { assert_root; bootstrap_prepare; }
+cmd_chroot_mount()  { assert_root; mount_all; }
+cmd_chroot_umount() { assert_root; umount_all; }
+cmd_chroot_status() {
+  bootstrap_runtime
+  echo "== CHROOT STATUS (${LFS_ROOT}) =="
+  mount | grep "${LFS_ROOT}" || echo "(Sem mounts sobre ${LFS_ROOT})"
+  if [[ -f "${LFS_ROOT}/etc/resolv.conf" ]]; then echo "DNS OK (resolv.conf presente)"; else echo "DNS ausente (sem /etc/resolv.conf)"; fi
 }
-
-cmd_fetch_git() {
-  dl_bootstrap
-  local url="" ref="" name="" outdir="${LFS_CACHE}/tarballs"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --url) url="$2"; shift 2 ;;
-      --ref) ref="$2"; shift 2 ;;
-      --name) name="$2"; shift 2 ;;
-      --outdir) outdir="$2"; shift 2 ;;
-      *) die 2 "Uso: lfsctl fetch git --url URL --ref REF --name NAME [--outdir DIR]" ;;
-    esac
-  done
-  [[ -n "${url}" && -n "${ref}" && -n "${name}" ]] || die 2 "Faltam --url/--ref/--name"
-  local out
-  with_flock "git-archive" 3600 bash -c '
-    dl_git_archive --url "'"${url}"'" --ref "'"${ref}"'" --name "'"${name}"'" --outdir "'"${outdir}"'"
-  ' | { read -r out; echo "${out}"; }
-}
-
-cmd_verify() {
-  dl_bootstrap
-  local file sha sig="" keyring="${LFS_KEYS_DIR}"
-  [[ -n "${1:-}" ]] || die 2 "Uso: lfsctl verify <FILE> --sha256 HEX [--sig SIGFILE] [--keyring DIR]"
-  file="$1"; shift
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --sha256) sha="$2"; shift 2 ;;
-      --sig)    sig="$2"; shift 2 ;;
-      --keyring) keyring="$2"; shift 2 ;;
-      *) die 2 "Parâmetro inválido: $1" ;;
-    esac
-  done
-  [[ -f "${file}" ]] || die 2 "Arquivo não encontrado: ${file}"
-  [[ -n "${sha:-}" ]] || die 2 "Falta --sha256"
-  dl_verify_sha256 "${file}" "${sha}"
-  if [[ -n "${sig}" ]]; then
-    [[ -f "${sig}" ]] || die 2 "Assinatura não encontrada: ${sig}"
-    dl_verify_gpg "${file}" "${sig}" "${keyring}"
-  fi
-}
-
-cmd_cache_ls() {
-  dl_bootstrap
-  local which="${1:-all}"
-  case "${which}" in
-    all)      printf "sources:\n"; ls -1 "${LFS_CACHE}/sources" 2>/dev/null || true; printf "\n tarballs:\n"; ls -1 "${LFS_CACHE}/tarballs" 2>/dev/null || true; printf "\n git:\n"; ls -1 "${LFS_CACHE}/git" 2>/dev/null || true ;;
-    sources)  ls -lh "${LFS_CACHE}/sources" 2>/dev/null || true ;;
-    tarballs) ls -lh "${LFS_CACHE}/tarballs" 2>/dev/null || true ;;
-    git)      ls -lh "${LFS_CACHE}/git" 2>/dev/null || true ;;
-    *) die 2 "cache ls [sources|tarballs|git|all]" ;;
-  esac
-}
-
-cmd_cache_clean() {
+cmd_chroot_enter() {
   assert_root
-  dl_bootstrap
-  local which="${1:-all}"
-  case "${which}" in
-    all)      rm -rf "${LFS_CACHE}/sources"/* "${LFS_CACHE}/tarballs"/* "${LFS_CACHE}/git"/* 2>/dev/null || true ;;
-    sources)  rm -rf "${LFS_CACHE}/sources"/* 2>/dev/null || true ;;
-    tarballs) rm -rf "${LFS_CACHE}/tarballs"/* 2>/dev/null || true ;;
-    git)      rm -rf "${LFS_CACHE}/git"/* 2>/dev/null || true ;;
-    *) die 2 "cache clean [sources|tarballs|git|all]" ;;
-  esac
-  log_ok "Cache limpo: ${which}"
+  if [[ "${1:-}" == "--" ]]; then shift; [[ "$#" -ge 1" " ]] || die 2 "Uso: lfsctl chroot enter [-- CMD ...]"; local cmd="$*"; chroot_exec "${cmd}"; else chroot_shell; fi
+}
+cmd_chroot_exec() {
+  assert_root
+  [[ "${1:-}" == "--" ]] || die 2 "Uso: lfsctl chroot exec -- CMD..."
+  shift
+  [[ "$#" -ge 1 ]] || die 2 "Falta comando para executar"
+  chroot_exec "$*"
+}
+cmd_destdir_run() {
+  bootstrap_runtime
+  local dest=""
+  [[ "${1:-}" == "--dest" ]] || die 2 "Uso: lfsctl destdir run --dest DIR -- CMD..."
+  shift
+  dest="$1"; shift
+  [[ "${1:-}" == "--" ]] || die 2 "Uso: lfsctl destdir run --dest DIR -- CMD..."
+  shift
+  [[ "$#" -ge 1 ]] || die 2 "Falta comando para executar"
+  destdir_run "${dest}" "$*"
 }
 
 #-------------------------
@@ -182,7 +121,7 @@ main() {
   local cmd="${1:-}"; shift || true
   case "${cmd}" in
     ""|-h|--help|help) usage ;;
-    # Módulo 1
+    # Core
     version)           cmd_version ;;
     init)              cmd_init ;;
     doctor)            cmd_doctor ;;
@@ -191,23 +130,14 @@ main() {
     log-demo|logdemo)  cmd_log_demo ;;
     lock)              case "${1:-}" in test) shift; cmd_lock_test "${1:-example}";; *) usage; exit 2;; esac ;;
     config)            case "${1:-}" in print) shift; cmd_config_print ;; set) shift; cmd_config_set "$@" ;; *) usage; exit 2 ;; esac ;;
-    # Módulo 2
-    fetch)
-      case "${1:-}" in
-        url)  shift; cmd_fetch_url "$@" ;;
-        list) shift; cmd_fetch_list "$@" ;;
-        git)  shift; cmd_fetch_git "$@" ;;
-        *) usage; exit 2 ;;
-      esac
-      ;;
+    # Downloader
+    fetch)             case "${1:-}" in url) shift; cmd_fetch_url "$@" ;; list) shift; cmd_fetch_list "$@" ;; git) shift; cmd_fetch_git "$@" ;; *) usage; exit 2 ;; esac ;;
     verify)            cmd_verify "$@" ;;
-    cache)
-      case "${1:-}" in
-        ls)    shift; cmd_cache_ls "${1:-all}" ;;
-        clean) shift; cmd_cache_clean "${1:-all}" ;;
-        *) usage; exit 2 ;;
-      esac
-      ;;
+    cache)             case "${1:-}" in ls) shift; cmd_cache_ls "${1:-all}" ;; clean) shift; cmd_cache_clean "${1:-all}" ;; *) usage; exit 2 ;; esac ;;
+    # Chroot & Bootstrap
+    chroot)            case "${1:-}" in init) shift; cmd_chroot_init ;; mount) shift; cmd_chroot_mount ;; umount) shift; cmd_chroot_umount ;; status) shift; cmd_chroot_status ;; enter) shift; cmd_chroot_enter "$@" ;; exec) shift; cmd_chroot_exec "$@" ;; *) usage; exit 2 ;; esac ;;
+    destdir)           case "${1:-}" in run) shift; cmd_destdir_run "$@" ;; *) usage; exit 2 ;; esac ;;
+    # Fallback
     *)
       log_error "Comando desconhecido: ${cmd}"
       usage
