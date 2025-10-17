@@ -7,6 +7,8 @@ set -euo pipefail
 : "${LFS_RUNTIME:=/usr/local/lib/lfs}"
 # shellcheck source=/usr/local/lib/lfs/common.sh
 . "${LFS_RUNTIME}/packager.sh"
+# shellcheck source=/usr/local/lib/lfs/rebuild.sh
+. "${LFS_RUNTIME}/rebuild.sh"
 # shellcheck source=/usr/local/lib/lfs/packager.sh
 . "${LFS_RUNTIME}/common.sh"
 # shellcheck source=/usr/local/lib/lfs/downloader.sh
@@ -258,6 +260,20 @@ _run_stage() {
 _write_meta() {
   local name="$1" destdir="$2"
   recipe_load "${name}"
+
+  # fingerprints
+  local envfp; envfp="$(env_fingerprint)"
+  local abifp; abifp="$(abi_fingerprint_from_dir "${destdir}")"
+  local toolfp; toolfp="$(toolchain_fingerprint)"
+
+  # versões das dependências no momento do build
+  local depv=()
+  local d ev
+  for d in ${DEPS[*]:-}; do
+    ev="$(is_installed "$d" && awk -F= '$1=="evr"{print $2}' "${LFS_DB_DIR}/installed/${d}.meta" || echo "")"
+    [[ -n "${ev}" ]] && depv+=("${d}=${ev}")
+  done
+
   local mdir="${LFS_DB_DIR}/installed"
   mkdir -p "${mdir}"
   local meta="${mdir}/${NAME}.meta"
@@ -266,20 +282,19 @@ _write_meta() {
     echo "version=${VERSION}"
     echo "epoch=${EPOCH}"
     echo "release=${RELEASE}"
+    echo "evr=${EPOCH}:${VERSION}-${RELEASE}"
     echo "build_time=$(date -u +%s)"
     echo "deps=${DEPS[*]:-}"
     echo "build_deps=${BUILD_DEPS[*]:-}"
+    echo "dep_versions=${depv[*]:-}"
     echo "destdir=${destdir}"
+    echo "env_fp=${envfp}"
+    echo "abi_fp=${abifp}"
+    echo "toolchain_fp=${toolfp}"
   } > "${meta}.tmp"
   mv -f "${meta}.tmp" "${meta}"
   log_ok "Metadados gravados: ${meta}"
 }
-
-is_installed() {
-  local name="$1"
-  [[ -f "${LFS_DB_DIR}/installed/${name}.meta" ]]
-}
-
 #-----------------------------
 # Build único (com fetch/extract/patch/run)
 #-----------------------------
