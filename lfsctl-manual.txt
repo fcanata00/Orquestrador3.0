@@ -1,0 +1,331 @@
+===============================================================================
+                           LFSCTL v1.8.0 — MANUAL TÉCNICO COMPLETO
+===============================================================================
+
+Autor: fcanata
+Baseado em Linux From Scratch (LFS) e Beyond Linux From Scratch (BLFS)
+Versão: 1.0.0 (2025-10)
+===============================================================================
+
+ÍNDICE
+-------
+1. Visão geral
+2. Estrutura de diretórios
+3. Instalação e configuração
+4. Modo de operação
+5. Comandos do lfsctl
+6. Variáveis de ambiente globais
+7. Estrutura de uma receita
+8. Fases de build
+9. Empacotamento e instalação
+10. Upgrade e rollback
+11. Rebuild inteligente
+12. Hooks e eventos
+13. Uso em chroot e bootstrap
+14. Exemplos práticos
+15. Problemas comuns e soluções
+===============================================================================
+
+
+1. VISÃO GERAL
+--------------
+lfsctl é um sistema automatizado de construção, empacotamento e gerenciamento
+de sistemas Linux From Scratch e Beyond LFS. Ele automatiza o ciclo completo:
+
+   download → patch → build → install → package → upgrade → rollback → rebuild
+
+Ele é modular e composto por scripts em:
+   /usr/local/lib/lfs/
+
+Cada módulo cobre uma parte da construção:
+   common.sh, downloader.sh, chroot.sh, recipes.sh, builder.sh,
+   packager.sh, rebuild.sh, upgrade.sh
+
+
+2. ESTRUTURA DE DIRETÓRIOS
+---------------------------
+Padrão (ajustável via variáveis):
+
+  /mnt/lfs                  – raiz do sistema em construção (bootstrap)
+  /mnt/lfs/tools            – toolchain inicial
+  /usr/local/lib/lfs        – módulos de execução
+  /usr/local/bin/lfsctl     – comando principal
+  /etc/lfs/recipes          – receitas locais do usuário
+  /usr/share/lfs/recipes    – receitas do sistema
+  /var/lib/lfs/             – dados persistentes
+     ├── cache/             – cache de fontes e patches
+     ├── packages/          – pacotes empacotados (.tar.zst)
+     ├── manifests/         – manifests de arquivos instalados
+     ├── db/installed/      – metadados de pacotes instalados
+     ├── delta/             – deltas de upgrade
+     ├── rollback/          – bundles de rollback
+     └── history/           – logs e histórico
+
+  /etc/lfs/hooks            – hooks globais (pre/post install, upgrade, etc.)
+  /usr/share/doc/lfsctl-manual.txt – este manual
+
+
+3. INSTALAÇÃO E CONFIGURAÇÃO
+----------------------------
+
+1. Copie os módulos para /usr/local/lib/lfs/
+2. Instale o lfsctl principal:
+     sudo install -m 0755 lfsctl /usr/local/bin/lfsctl
+
+3. Crie diretórios iniciais:
+     sudo mkdir -p /etc/lfs/recipes /var/lib/lfs/{packages,cache,db,manifests,delta,rollback,history}
+     sudo chown -R $(whoami):root /etc/lfs /var/lib/lfs
+
+4. Configure variáveis de ambiente (adicione ao ~/.bashrc):
+     export LFS=/mnt/lfs
+     export LFS_TGT=$(uname -m)-lfs-linux-gnu
+     export LFS_TOOLS=/mnt/lfs/tools
+     export LFS_RECIPES_GIT_DIR=$HOME/dev/receitas-lfs
+
+5. Para bootstrap:
+     monte partições:
+       sudo mount /dev/sdX /mnt/lfs
+       sudo mkdir -pv /mnt/lfs/{sources,tools}
+       sudo chown -v $(whoami) /mnt/lfs/{sources,tools}
+
+6. Para chroot:
+     sudo lfsctl chroot enter
+
+
+4. MODO DE OPERAÇÃO
+-------------------
+lfsctl funciona em dois modos:
+
+  • Modo normal (host):
+       usado para preparar, compilar e empacotar receitas.
+
+  • Modo chroot:
+       executa builds isolados dentro do /mnt/lfs.
+
+Durante o bootstrap, apenas ferramentas essenciais (binutils-pass1,
+gcc-pass1, glibc-pass1 etc.) são construídas com DESTDIR e fakeroot.
+
+Após o bootstrap, o sistema opera normalmente dentro do chroot.
+
+
+5. COMANDOS DO LFSCTL
+---------------------
+Uso geral:
+   lfsctl [opções] <comando> [subcomando] [args...]
+
+Abreviações:
+   -i <tar.zst>, --install <tar.zst>   → Atalho para pkg install
+
+Principais comandos:
+
+SYSTEMA:
+   init, doctor, status, logs, lock, config
+
+DOWNLOAD:
+   fetch url|git|list, verify, cache ls|clean
+
+BUILD:
+   recipe path|print|lint, deps graph|tree,
+   build <pacote>, build list
+
+CHROOT:
+   chroot init|mount|umount|enter|exec, destdir run
+
+PKG:
+   pkg create|install|uninstall|upgrade|info|files|verify|list|gc
+
+REBUILD:
+   rebuild plan world|changed|intelligent, rebuild run, rebuild save-toolchain-fp
+
+UPGRADE/ROLLBACK:
+   upgrade smart, rollback <pkg>
+
+DELTA/HISTORY:
+   delta show <pkg>, history <pkg>
+
+PROGRAM:
+   program search <termo>, program info <nome>
+
+Exemplos:
+   lfsctl fetch url gcc-pass1
+   lfsctl build zlib
+   lfsctl pkg create zlib
+   lfsctl -i /var/lib/lfs/packages/zlib-1.3.1-1.tar.zst
+   sudo lfsctl upgrade smart zlib
+   lfsctl program search openssl
+   lfsctl program info gcc
+
+
+6. VARIÁVEIS DE AMBIENTE GLOBAIS
+--------------------------------
+Essenciais:
+  LFS                → raiz do sistema alvo (/mnt/lfs)
+  LFS_TOOLS          → /mnt/lfs/tools
+  LFS_TGT            → target triplet (ex: x86_64-lfs-linux-gnu)
+  LFS_RECIPES_DIR    → /etc/lfs/recipes
+  LFS_RECIPES_GIT_DIR→ repositório git de receitas
+  LFS_PKG_DIR        → /var/lib/lfs/packages
+  LFS_SRC_CACHE      → /var/lib/lfs/cache
+  LFS_MANIFESTS_DIR  → /var/lib/lfs/manifests
+  LFS_HISTORY_DIR    → /var/lib/lfs/history
+  LFS_DELTA_DIR      → /var/lib/lfs/delta
+  JOBS               → número de jobs paralelos
+  DESTDIR            → diretório de instalação temporária
+  CFLAGS, CXXFLAGS, LDFLAGS → flags de compilação
+
+Variáveis automáticas internas:
+  pkgname, pkgver, pkgrel, builddir, srcdir, section, etc.
+
+
+7. ESTRUTURA DE UMA RECEITA
+----------------------------
+As receitas ficam em /etc/lfs/recipes/<nome>.sh
+
+Blocos básicos:
+
+  pkgname="zlib"
+  pkgver="1.3.1"
+  pkgrel="1"
+  pkgdesc="Biblioteca de compressão zlib"
+  url="https://zlib.net/"
+  license="Zlib"
+  source=("https://zlib.net/zlib-${pkgver}.tar.xz")
+  sha256sums=("e8f4c56a...")
+  depends=()
+  makedepends=(cmake)
+  builddir="zlib-${pkgver}"
+  options=(strip fakeroot tar.zst hooks parallel)
+
+Fases padrão (todas opcionais, mas executadas se definidas):
+  prepare()
+  configure()
+  build()
+  check()
+  install()
+  post_install()
+  pre_uninstall()
+  post_uninstall()
+  pre_upgrade()
+  post_upgrade()
+
+Cada fase é executada em ordem, dentro de chroot se habilitado.
+
+
+8. FASES DE BUILD
+-----------------
+1. prepare:   extrai, aplica patches, ajusta Makefiles
+2. configure: roda ./configure, cmake, meson etc.
+3. build:     compila (make)
+4. check:     testa (make check)
+5. install:   instala em DESTDIR
+6. post_install: limpa, cria links, roda hooks
+
+
+9. EMPACOTAMENTO E INSTALAÇÃO
+-----------------------------
+Depois de instalar em DESTDIR, o packager cria:
+
+   /var/lib/lfs/packages/<pkgname>-<ver>-<rel>.tar.zst
+   /var/lib/lfs/manifests/<pkgname>.manifest
+   /var/lib/lfs/db/installed/<pkgname>.meta
+
+Instalação:
+   lfsctl -i <pacote.tar.zst>
+
+O sistema registra hashes, manifestos e fingerprints.
+
+Desinstalação:
+   lfsctl pkg uninstall <pkg>
+
+Upgrade inteligente:
+   lfsctl upgrade smart <pkg>
+
+
+10. UPGRADE E ROLLBACK
+----------------------
+Cada upgrade cria:
+   /var/lib/lfs/delta/<pkg>/<old>_to_<new>.delta
+   /var/lib/lfs/rollback/<pkg>/<old>.bundle
+
+Rollback:
+   lfsctl rollback <pkg> prev
+
+Delta diff:
+   lfsctl delta show <pkg>
+
+
+11. REBUILD INTELIGENTE
+------------------------
+Baseado em fingerprints de ambiente, ABI e toolchain.
+Rebuild completo:
+   lfsctl rebuild plan world
+   lfsctl rebuild run
+
+Rebuild incremental:
+   lfsctl rebuild plan changed
+
+
+12. HOOKS E EVENTOS
+-------------------
+Diretório: /etc/lfs/hooks/
+Hooks disponíveis:
+   pre-install.d/
+   post-install.d/
+   pre-upgrade.d/
+   post-upgrade.d/
+   pre-uninstall.d/
+   post-uninstall.d/
+
+Executados automaticamente em ordem lexicográfica.
+
+
+13. USO EM CHROOT E BOOTSTRAP
+------------------------------
+Bootstrap (host):
+  export LFS=/mnt/lfs
+  mkdir -pv $LFS/{tools,sources}
+  export LFS_TGT=$(uname -m)-lfs-linux-gnu
+  sudo lfsctl chroot init
+  sudo lfsctl chroot mount
+  sudo lfsctl build binutils-pass1
+  sudo lfsctl build gcc-pass1
+  sudo lfsctl build glibc-pass1
+  sudo lfsctl chroot enter
+  # Dentro do chroot, continue builds normais.
+
+Para sair:
+  exit
+  sudo lfsctl chroot umount
+
+
+14. EXEMPLOS PRÁTICOS
+----------------------
+Construir pacote:
+   lfsctl build zlib
+Empacotar:
+   lfsctl pkg create zlib
+Instalar:
+   sudo lfsctl -i /var/lib/lfs/packages/zlib-1.3.1-1.tar.zst
+Atualizar:
+   sudo lfsctl upgrade smart zlib
+Reverter:
+   sudo lfsctl rollback zlib
+Buscar receitas:
+   lfsctl program search openssl
+Ver detalhes:
+   lfsctl program info openssl
+Rebuild completo:
+   sudo lfsctl rebuild plan world && sudo lfsctl rebuild run
+
+
+15. PROBLEMAS COMUNS
+---------------------
+Erro “módulo ausente” → verifique /usr/local/lib/lfs
+Erro “permission denied” → use sudo ou corrija permissões de /mnt/lfs
+Erro “DESTDIR vazio” → certifique-se que o builddir tem Makefile válido
+Falha em patch → verifique URLs e hashes
+Falha de fingerprint → limpe cache: lfsctl cache clean all
+
+===============================================================================
+FIM DO MANUAL
+===============================================================================
