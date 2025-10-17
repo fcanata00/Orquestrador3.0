@@ -1,167 +1,484 @@
 #!/usr/bin/env bash
-# lfsctl — CLI (M1+M2+M3+M4)
+# lfsctl — CLI unificado (Módulos 1..7) + program search/info + atalhos (-i/--install)
+# Versão: 1.8.0
+# Instale em /usr/local/bin/lfsctl (chmod 0755)
+
 set -euo pipefail
 
 : "${LFS_RUNTIME:=/usr/local/lib/lfs}"
-# shellcheck source=/usr/local/lib/lfs/common.sh
-. "${LFS_RUNTIME}/common.sh"
-# shellcheck source=/usr/local/lib/lfs/downloader.sh
-. "${LFS_RUNTIME}/downloader.sh"
-# shellcheck source=/usr/local/lib/lfs/chroot.sh
-. "${LFS_RUNTIME}/chroot.sh"
-# shellcheck source=/usr/local/lib/lfs/recipes.sh
-. "${LFS_RUNTIME}/recipes.sh"
-# shellcheck source=/usr/local/lib/lfs/builder.sh"
-. "${LFS_RUNTIME}/builder.sh"
 
-VERSION="1.3.0"
+# Diretórios padrão conhecidos pelos módulos (valores podem vir dos módulos também)
+: "${LFS_ROOT_INSTALL:=/mnt/lfs}"
+: "${LFS_DB_DIR:=/var/lib/lfs/db}"
+: "${LFS_INSTALLED_DIR:=/var/lib/lfs/db/installed}"
+: "${LFS_PKG_DIR:=/var/lib/lfs/packages}"
+: "${LFS_MANIFESTS_DIR:=/var/lib/lfs/manifests}"
+: "${LFS_HISTORY_DIR:=/var/lib/lfs/history}"
+: "${LFS_DELTA_DIR:=/var/lib/lfs/delta}"
+: "${LFS_HOOKS_DIR:=/etc/lfs/hooks}"
+
+# Locais de receitas (padrões dos módulos já entregues)
+: "${LFS_RECIPES_DIR:=/etc/lfs/recipes}"
+: "${LFS_RECIPES_SYS:=/usr/share/lfs/recipes}"
+
+# NOVO: caminho local do seu repositório Git com receitas novas (configure para habilitar a busca)
+# Ex.: export LFS_RECIPES_GIT_DIR=/home/usuario/dev/receitas-lfs
+: "${LFS_RECIPES_GIT_DIR:=}"
+
+# Carrega os módulos — obrigatórios
+for mod in common.sh downloader.sh chroot.sh recipes.sh builder.sh packager.sh rebuild.sh upgrade.sh; do
+  if [[ -f "${LFS_RUNTIME}/${mod}" ]]; then
+    # shellcheck source=/usr/local/lib/lfs/common.sh
+    . "${LFS_RUNTIME}/${mod}"
+  else
+    echo "Erro: módulo ausente: ${LFS_RUNTIME}/${mod}" >&2
+    exit 2
+  fi
+done
+
+VERSION="1.8.0"
 
 usage() {
-  cat <<'USAGE'
-lfsctl 1.3.0
-Uso: lfsctl <comando> [opções]
+  cat <<USAGE
+lfsctl ${VERSION}
+Uso: lfsctl [opções] <comando> [subcomando|args]
 
-Core:
-  version                     Mostra versão
-  init                        Cria diretórios padrão e config inicial
-  doctor                      Verifica dependências do ambiente
-  status                      Mostra resumo de configuração/paths
-  logs [N]                    Mostra últimas N linhas de log
-  log-demo                    Gera entradas de log
-  lock test [NAME]            Testa lock
-  config print                Exibe config efetiva
-  config set KEY=VAL [...]    Atualiza/insere chaves
+Abreviações suportadas:
+  -i <tar.zst>, --install <tar.zst>     Atalho para 'pkg install <tar.zst>' (requer root)
 
-Downloader & Cache:
-  fetch url <URL> --sha256 HEX [--sig SIG] [--outdir DIR] [--name FILENAME]
-  fetch list <FILE> [--parallel N] [--outdir DIR]
-  fetch git --url URL --ref REF --name NAME [--outdir DIR]
-  verify <FILE> --sha256 HEX [--sig SIGFILE] [--keyring DIR]
-  cache ls [sources|tarballs|git]
-  cache clean [sources|tarballs|git|all]
+Principais comandos (M1..M7):
+  version
+  init | doctor | status | config | logs | lock
+  fetch | verify | cache
+  chroot | destdir
+  recipe | deps | build
+  pkg (create|install|uninstall|upgrade|info|files|verify|list|gc)
+  rebuild | check | abi | env
+  upgrade smart
+  rollback
+  delta show
+  history
+  program (search|info)
 
-Chroot & Bootstrap:
-  chroot init|mount|umount|status
-  chroot enter [-- CMD...]    Entra no chroot ou executa CMD
-  chroot exec -- CMD...       Executa CMD não interativo no chroot
-  destdir run --dest DIR -- CMD...
+Programas:
+  program search <query>     — busca em receitas locais, manifests, pacotes e também no seu repositório Git (LFS_RECIPES_GIT_DIR)
+  program info <name>        — mostra informação completa do programa (receita, instalado, manifest, arquivos, deltas, histórico, deps, fingerprints)
 
-Receitas & Build:
-  recipe path <name>          Mostra caminho da receita
-  recipe print <name>         Mostra receita normalizada
-  recipe lint <name>          Valida receita
-  deps graph <name>           Imprime ordem topológica (com dependências)
-  deps tree <name>            Árvore de dependências
-  build <name> [--rebuild] [--force] [--jobs N] [--chroot]
-  build list <arquivo> [--jobs N] [--rebuild] [--force] [--chroot]
-
-Observações:
-  - Receitas são Bash em: /var/lib/lfs/recipes ou /usr/local/share/lfs/recipes
-  - Campos mínimos: NAME, VERSION; fontes em arrays SOURCE/STA256 e patches em PATCHES/PATCHES_SHA256.
-  - Staging (DESTDIR) padrão: /mnt/lfs/pkg/<name>-<version>
+Exemplos:
+  lfsctl -i /var/lib/lfs/packages/zlib-1.3.1-1.tar.zst
+  lfsctl program search zlib
+  lfsctl program info zlib
+  sudo lfsctl upgrade smart zlib --jobs 0 --chroot
 USAGE
 }
 
-# ==== Core (M1) ====
-cmd_version() { echo "lfsctl ${VERSION}"; }
-cmd_init()    { assert_root; log_info "Inicializando..."; bootstrap_runtime; log_ok "OK."; print_env_summary | sed 's/^/  - /'; }
-cmd_doctor()  { bootstrap_runtime; log_info "Verificando dependências..."; if doctor_checks; then log_ok "Ambiente OK."; else log_error "Dependências faltantes."; exit 2; fi; }
-cmd_status()  { bootstrap_runtime; echo "== STATUS =="; print_env_summary; echo; echo "Locks: ${LFS_LOCK_DIR}"; echo "DB: ${LFS_DB_DIR}"; echo "Receitas: ${LFS_RECIPES_DIR}"; echo "Logs: ${LFS_LOG_FILE}"; }
-cmd_logs()    { bootstrap_runtime; tail_logs "${1:-200}"; }
-cmd_log_demo(){ bootstrap_runtime; log_info "Info"; log_ok "OK"; log_warn "Warn"; log_error "Erro"; log_debug "Debug"; echo "Log: ${LFS_LOG_FILE}"; }
-cmd_lock_test(){ bootstrap_runtime; local name="${1:-example}"; with_flock "${name}" 5 bash -c 'sleep 1'; log_ok "Lock ok"; }
-cmd_config_print(){ bootstrap_runtime; echo "# Config efetiva"; print_env_summary; echo; echo "# Arquivos:"; echo "  - ${LFS_DEFAULT_CONFIG_FILE}"; if compgen -G "${LFS_ETC_D}/*.conf" >/dev/null; then for cf in "${LFS_ETC_D}"/*.conf; do echo "  - ${cf}"; done; else echo "  - (sem overrides)"; fi; }
-cmd_config_set(){ assert_root; bootstrap_runtime; [[ "$#" -ge 1 ]] || die 2 "Uso: lfsctl config set KEY=VAL [...]"; local kv key val; touch "${LFS_DEFAULT_CONFIG_FILE}"; chmod 0644 "${LFS_DEFAULT_CONFIG_FILE}"; for kv in "$@"; do [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die 2 "Par inválido: ${kv}"; key="${kv%%=*}"; val="${kv#*=}"; if grep -qE "^${key}=" "${LFS_DEFAULT_CONFIG_FILE}"; then sed -i -E "s|^${key}=.*|${key}=${val}|g" "${LFS_DEFAULT_CONFIG_FILE}"; else echo "${key}=${val}" >> "${LFS_DEFAULT_CONFIG_FILE}"; fi; log_ok "${key}=${val}"; done; }
-
-# ==== Downloader (M2) ====
-cmd_fetch_url() { dl_bootstrap; local url sha sig="" outdir="${LFS_CACHE}/sources" name=""; [[ "${1:-}" =~ ^https?:// ]] || die 2 "Uso: lfsctl fetch url <URL> --sha256 HEX [--sig SIG] [--outdir DIR] [--name FILENAME]"; url="$1"; shift; while [[ $# -gt 0 ]]; do case "$1" in --sha256) sha="$2"; shift 2;; --sig) sig="$2"; shift 2;; --outdir) outdir="$2"; shift 2;; --name) name="$2"; shift 2;; *) die 2 "Parâmetro inválido: $1";; esac; done; [[ -n "${sha:-}" ]] || die 2 "Falta --sha256"; local fname; if [[ -n "${name}" ]]; then fname="${name}"; else fname="$(basename -- "$url")"; fi; local out="${outdir}/${fname}"; with_flock "fetch" 600 bash -c 'dl_fetch_one "'"${fname}"'" "'"${url}"'" "'"${sha}"'" "'"${sig}"'" "'"${outdir}"'" >/dev/null'; echo "${out}"; }
-cmd_fetch_list() { dl_bootstrap; local list="${1:-}"; shift || true; [[ -n "${list}" ]] || die 2 "Uso: lfsctl fetch list <FILE> [--parallel N] [--outdir DIR]"; local parallel="$(effective_jobs)" outdir="${LFS_CACHE}/sources"; while [[ $# -gt 0 ]]; do case "$1" in --parallel) parallel="$2"; shift 2;; --outdir) outdir="$2"; shift 2;; *) die 2 "Parâmetro inválido: $1";; esac; done; with_flock "fetch" 3600 bash -c 'dl_fetch_list "'"${list}"'" "'"${outdir}"'" "'"${parallel}"'"'; }
-cmd_fetch_git() { dl_bootstrap; local url="" ref="" name="" outdir="${LFS_CACHE}/tarballs"; while [[ $# -gt 0 ]]; do case "$1" in --url) url="$2"; shift 2;; --ref) ref="$2"; shift 2;; --name) name="$2"; shift 2;; --outdir) outdir="$2"; shift 2;; *) die 2 "Uso: lfsctl fetch git --url URL --ref REF --name NAME [--outdir DIR]";; esac; done; [[ -n "${url}" && -n "${ref}" && -n "${name}" ]] || die 2 "Faltam --url/--ref/--name"; with_flock "git-archive" 3600 bash -c 'dl_git_archive --url "'"${url}"'" --ref "'"${ref}"'" --name "'"${name}"'" --outdir "'"${outdir}"'"'; }
-cmd_verify() { dl_bootstrap; local file sha sig="" keyring="${LFS_KEYS_DIR}"; [[ -n "${1:-}" ]] || die 2 "Uso: lfsctl verify <FILE> --sha256 HEX [--sig SIGFILE] [--keyring DIR]"; file="$1"; shift; while [[ $# -gt 0 ]]; do case "$1" in --sha256) sha="$2"; shift 2;; --sig) sig="$2"; shift 2;; --keyring) keyring="$2"; shift 2;; *) die 2 "Parâmetro inválido: $1";; esac; done; [[ -f "${file}" ]] || die 2 "Arquivo não encontrado: ${file}"; [[ -n "${sha:-}" ]] || die 2 "Falta --sha256"; dl_verify_sha256 "${file}" "${sha}"; [[ -n "${sig}" ]] && dl_verify_gpg "${file}" "${sig}" "${keyring}"; }
-cmd_cache_ls() { dl_bootstrap; local which="${1:-all}"; case "${which}" in all) printf "sources:\n"; ls -1 "${LFS_CACHE}/sources" 2>/dev/null || true; printf "\n tarballs:\n"; ls -1 "${LFS_CACHE}/tarballs" 2>/dev/null || true; printf "\n git:\n"; ls -1 "${LFS_CACHE}/git" 2>/dev/null || true ;; sources) ls -lh "${LFS_CACHE}/sources" 2>/dev/null || true ;; tarballs) ls -lh "${LFS_CACHE}/tarballs" 2>/dev/null || true ;; git) ls -lh "${LFS_CACHE}/git" 2>/dev/null || true ;; *) die 2 "cache ls [sources|tarballs|git|all]";; esac; }
-cmd_cache_clean() { assert_root; dl_bootstrap; local which="${1:-all}"; case "${which}" in all) rm -rf "${LFS_CACHE}/sources"/* "${LFS_CACHE}/tarballs"/* "${LFS_CACHE}/git"/* 2>/dev/null || true ;; sources) rm -rf "${LFS_CACHE}/sources"/* 2>/dev/null || true ;; tarballs) rm -rf "${LFS_CACHE}/tarballs"/* 2>/dev/null || true ;; git) rm -rf "${LFS_CACHE}/git"/* 2>/dev/null || true ;; *) die 2 "cache clean [sources|tarballs|git|all]";; esac; log_ok "Cache limpo: ${which}"; }
-
-# ==== Chroot (M3) ====
-cmd_chroot_init()   { assert_root; bootstrap_prepare; }
-cmd_chroot_mount()  { assert_root; mount_all; }
-cmd_chroot_umount() { assert_root; umount_all; }
-cmd_chroot_status() { bootstrap_runtime; echo "== CHROOT STATUS (/mnt/lfs) =="; mount | grep "/mnt/lfs" || echo "(Sem mounts)"; [[ -f "/mnt/lfs/etc/resolv.conf" ]] && echo "DNS OK" || echo "DNS ausente"; }
-cmd_chroot_enter()  { assert_root; if [[ "${1:-}" == "--" ]]; then shift; [[ "$#" -ge 1 ]] || die 2 "Uso: lfsctl chroot enter [-- CMD ...]"; chroot_exec "$*"; else chroot_shell; fi }
-cmd_chroot_exec()   { assert_root; [[ "${1:-}" == "--" ]] || die 2 "Uso: lfsctl chroot exec -- CMD..."; shift; [[ "$#" -ge 1 ]] || die 2 "Falta comando"; chroot_exec "$*"; }
-cmd_destdir_run()   { bootstrap_runtime; [[ "${1:-}" == "--dest" ]] || die 2 "Uso: lfsctl destdir run --dest DIR -- CMD..."; shift; local dest="$1"; shift; [[ "${1:-}" == "--" ]] || die 2 "Uso: lfsctl destdir run --dest DIR -- CMD..."; shift; [[ "$#" -ge 1 ]] || die 2 "Falta comando"; destdir_run "${dest}" "$*"; }
-
-# ==== Receitas & Build (M4) ====
-cmd_recipe_path()  { recipes_bootstrap; local n="${1:-}"; [[ -n "${n}" ]] || die 2 "Uso: lfsctl recipe path <name>"; local p; if p="$(recipe_path "${n}")"; then echo "${p}"; else die 1 "Receita não encontrada: ${n}"; fi; }
-cmd_recipe_print() { recipes_bootstrap; local n="${1:-}"; [[ -n "${n}" ]] || die 2 "Uso: lfsctl recipe print <name>"; recipe_print "${n}"; }
-cmd_recipe_lint()  { recipes_bootstrap; local n="${1:-}"; [[ -n "${n}" ]] || die 2 "Uso: lfsctl recipe lint <name>"; recipe_lint "${n}"; }
-cmd_deps_graph()   { recipes_bootstrap; local n="${1:-}"; [[ -n "${n}" ]] || die 2 "Uso: lfsctl deps graph <name>"; deps_graph "${n}"; }
-cmd_deps_tree()    { recipes_bootstrap; local n="${1:-}"; [[ -n "${n}" ]] || die 2 "Uso: lfsctl deps tree <name>"; deps_tree "${n}"; }
-cmd_build_one()    {
-  builder_bootstrap
-  local name="${1:-}"; shift || true
-  [[ -n "${name}" ]] || die 2 "Uso: lfsctl build <name> [--rebuild] [--force] [--jobs N] [--chroot]"
-  local rebuild=0 force=0 jobs="$(effective_jobs)" use_chroot=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --rebuild) rebuild=1; shift ;;
-      --force)   force=1; shift ;;
-      --jobs)    jobs="$2"; shift 2 ;;
-      --chroot)  use_chroot=1; shift ;;
-      *) die 2 "Parâmetro inválido: $1" ;;
-    esac
-  done
-  build_with_deps "${name}" "${jobs}" "${rebuild}" "${use_chroot}" "${force}"
-}
-cmd_build_list()   {
-  builder_bootstrap
-  local list="${1:-}"; shift || true
-  [[ -f "${list}" ]] || die 2 "Arquivo não encontrado: ${list}"
-  local rebuild=0 force=0 jobs="$(effective_jobs)" use_chroot=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --rebuild) rebuild=1; shift ;;
-      --force)   force=1; shift ;;
-      --jobs)    jobs="$2"; shift 2 ;;
-      --chroot)  use_chroot=1; shift ;;
-      *) die 2 "Parâmetro inválido: $1" ;;
-    esac
-  done
-  local name
-  while IFS= read -r name; do
-    [[ -z "${name}" || "${name:0:1}" == "#" ]] && continue
-    build_with_deps "${name}" "${jobs}" "${rebuild}" "${use_chroot}" "${force}"
-  done < "${list}"
+# ================
+# Abreviações top-level (-i/--install)
+# ================
+_handle_install_shortcut() {
+  local tar="$1"
+  [[ -n "${tar}" ]] || die 2 "Uso: lfsctl -i <pacote.tar.zst>"
+  assert_root
+  bootstrap_runtime || true
+  package_install "${tar}" "${LFS_ROOT_INSTALL}"
+  exit $?
 }
 
-# ---- Dispatcher ----
+if [[ "${1:-}" == "-i" ]]; then
+  [[ -n "${2:-}" ]] || { echo "Uso: lfsctl -i <pacote.tar.zst>" >&2; exit 2; }
+  _handle_install_shortcut "$2"
+elif [[ "${1:-}" == "--install" ]]; then
+  [[ -n "${2:-}" ]] || { echo "Uso: lfsctl --install <pacote.tar.zst>" >&2; exit 2; }
+  _handle_install_shortcut "$2"
+fi
+
+# =========================
+# PROGRAM: SEARCH / INFO
+# =========================
+
+# Lista de diretórios de receitas existentes (locais e git)
+_recipe_search_roots() {
+  local roots=()
+  [[ -d "${LFS_RECIPES_DIR}" ]] && roots+=("${LFS_RECIPES_DIR}")
+  [[ -d "${LFS_RECIPES_SYS}" ]] && roots+=("${LFS_RECIPES_SYS}")
+  if [[ -n "${LFS_RECIPES_GIT_DIR}" && -d "${LFS_RECIPES_GIT_DIR}" ]]; then
+    roots+=("${LFS_RECIPES_GIT_DIR}")
+  fi
+  printf '%s\n' "${roots[@]:-}"
+}
+
+# Busca case-insensitive por nome de receita (*.sh sem extensão) e por conteúdo
+program_search() {
+  local q="${1:-}"
+  [[ -n "${q}" ]] || die 2 "Uso: program search <query>"
+  bootstrap_runtime || true
+
+  log_info "Procurando por: ${q}"
+
+  local roots; roots="$(_recipe_search_roots || true)"
+
+  echo "=== Receitas (nome) ==="
+  if [[ -n "${roots}" ]]; then
+    while IFS= read -r d; do
+      find "$d" -type f -name '*.sh' -maxdepth 1 2>/dev/null \
+        | xargs -r -n1 basename \
+        | sed -E 's/\.sh$//' \
+        | grep -i "${q}" || true
+    done <<< "${roots}"
+  else
+    echo "(nenhum diretório de receitas disponível)"
+  fi
+
+  echo
+  echo "=== Receitas (conteúdo) ==="
+  if [[ -n "${roots}" ]]; then
+    while IFS= read -r d; do
+      grep -Hin --exclude-dir=*.d -E "${q}" "$d"/*.sh 2>/dev/null || true
+    done <<< "${roots}"
+  else
+    echo "(nenhuma receita para buscar)"
+  fi
+
+  echo
+  echo "=== Pacotes (.tar.zst) ==="
+  ls -1 "${LFS_PKG_DIR}" 2>/dev/null | grep -i "${q}" || true
+
+  echo
+  echo "=== Manifests ==="
+  ls -1 "${LFS_MANIFESTS_DIR}" 2>/dev/null | grep -i "${q}" || true
+
+  # Se for um diretório Git, opcionalmente mostra o branch/HEAD das receitas git
+  if [[ -n "${LFS_RECIPES_GIT_DIR}" && -d "${LFS_RECIPES_GIT_DIR}/.git" ]]; then
+    echo
+    echo "=== Git (receitas novas) ==="
+    (
+      cd "${LFS_RECIPES_GIT_DIR}"
+      local branch head
+      branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '-')"
+      head="$(git rev-parse --short HEAD 2>/dev/null || echo '-')"
+      echo "repo: ${LFS_RECIPES_GIT_DIR}  branch: ${branch}  head: ${head}"
+      git ls-files '*.sh' 2>/dev/null | grep -i "${q}" || true
+    )
+  fi
+}
+
+# Localiza a melhor receita para o nome (prioridade: local → sys → git)
+_best_recipe_path() {
+  local name="$1"
+  local cand
+  for cand in \
+      "${LFS_RECIPES_DIR}/${name}.sh" \
+      "${LFS_RECIPES_SYS}/${name}.sh" \
+      "${LFS_RECIPES_GIT_DIR}/${name}.sh"
+  do
+    [[ -f "$cand" ]] && { echo "$cand"; return 0; }
+  done
+  return 1
+}
+
+program_info() {
+  local name="${1:-}"
+  [[ -n "${name}" ]] || die 2 "Uso: program info <name>"
+  bootstrap_runtime || true
+
+  echo "=== Program Info: ${name} ==="
+
+  # Receita (caminho preferencial)
+  echo
+  echo "-- Receita (path preferencial) --"
+  if _best_recipe_path "${name}" >/dev/null 2>&1; then
+    _best_recipe_path "${name}"
+  else
+    echo "(não encontrada nos roots locais/git)"
+  fi
+
+  # Receita (impressão normalizada se existir recipe_load/print)
+  if recipe_path "${name}" >/dev/null 2>&1; then
+    echo
+    echo "-- Receita (normalizada) --"
+    recipe_print "${name}" || true
+  fi
+
+  # Estado instalado
+  echo
+  echo "-- Estado instalado --"
+  if is_installed "${name}"; then
+    package_info "${name}" || true
+    local meta="${LFS_INSTALLED_DIR}/${name}.meta"
+    local manifest=""
+    manifest="$(awk -F= '$1=="manifest"{print $2}' "${meta}" 2>/dev/null || true)"
+
+    echo
+    echo "-- Manifesto (amostra) --"
+    if [[ -n "${manifest}" && -f "${manifest}" ]]; then
+      echo "Manifesto: ${manifest}"
+      head -n 20 "${manifest}" || true
+    else
+      echo "(manifesto ausente)"
+    fi
+
+    echo
+    echo "-- Files (amostra) --"
+    package_files "${name}" | sed -n '1,80p' || true
+  else
+    echo "(não instalado)"
+  fi
+
+  # Pacotes disponíveis
+  echo
+  echo "-- Pacotes disponíveis (.tar.zst) --"
+  ls -1 "${LFS_PKG_DIR}" 2>/dev/null | grep -E "^${name}-" || true
+
+  # Deltas
+  echo
+  echo "-- Deltas disponíveis --"
+  if [[ -d "${LFS_DELTA_DIR}/${name}" ]]; then
+    ls -1 "${LFS_DELTA_DIR}/${name}" 2>/dev/null || true
+  else
+    echo "(nenhum delta salvo)"
+  fi
+
+  # Histórico
+  echo
+  echo "-- Histórico --"
+  if [[ -f "${LFS_HISTORY_DIR}/${name}.log" ]]; then
+    tail -n 100 "${LFS_HISTORY_DIR}/${name}.log" || true
+  else
+    echo "(sem histórico)"
+  fi
+
+  # Dependências (da receita) e reversas (instaladas)
+  echo
+  echo "-- Dependências (da receita) --"
+  if recipe_path "${name}" >/dev/null 2>&1; then
+    recipe_deps_all "${name}" | sed -n '1,200p' || true
+  else
+    echo "(sem receita para inspecionar dependências)"
+  fi
+
+  echo
+  echo "-- Dependentes instalados (reverse) --"
+  reverse_deps "${name}" || true
+
+  # Fingerprints
+  echo
+  echo "-- Fingerprints --"
+  if is_installed "${name}"; then
+    local envfp abifp toolfp
+    envfp="$(meta_get "${name}" "env_fp" || echo "")"
+    abifp="$(meta_get "${name}" "abi_fp" || echo "")"
+    toolfp="$(meta_get "${name}" "toolchain_fp" || echo "")"
+    echo "env_fp: ${envfp:-(n/a)}"
+    echo "abi_fp: ${abifp:-(n/a)}"
+    echo "toolchain_fp: ${toolfp:-(n/a)}"
+  else
+    echo "(não instalado — fingerprints indisponíveis)"
+  fi
+
+  # Se houver receita no Git com diferenças, mostrar status
+  if [[ -n "${LFS_RECIPES_GIT_DIR}" && -d "${LFS_RECIPES_GIT_DIR}/.git" ]]; then
+    local gp="${LFS_RECIPES_GIT_DIR}/${name}.sh"
+    if [[ -f "${gp}" ]]; then
+      echo
+      echo "-- Git (receita no repositório) --"
+      (
+        cd "${LFS_RECIPES_GIT_DIR}"
+        echo "arquivo: ${gp}"
+        git log -n 1 -- "${gp}" 2>/dev/null || true
+      )
+    fi
+  fi
+}
+
+# =========================
+# DISPATCHER
+# =========================
 main() {
-  local cmd="${1:-}"; shift || true
+  local cmd="${1:-}"
+  if [[ -z "${cmd}" || "${cmd}" == "-h" || "${cmd}" == "--help" || "${cmd}" == "help" ]]; then
+    usage; exit 0
+  fi
+
+  # Muitos comandos dependem do runtime
+  bootstrap_runtime || true
+
+  shift || true
   case "${cmd}" in
-    ""|-h|--help|help) usage ;;
-    # Core
-    version) cmd_version ;;
-    init)    cmd_init ;;
-    doctor)  cmd_doctor ;;
-    status)  cmd_status ;;
-    logs)    cmd_logs "${1:-}" ;;
+    version) echo "lfsctl ${VERSION}";;
+
+    # ----- Core (existem nos módulos) -----
+    init)           assert_root; cmd_init 2>/dev/null || cmd_init ;;
+    doctor)         cmd_doctor 2>/dev/null || cmd_doctor ;;
+    status)         cmd_status 2>/dev/null || cmd_status ;;
+    logs)           cmd_logs "${1:-}" ;;
     log-demo|logdemo) cmd_log_demo ;;
-    lock)    case "${1:-}" in test) shift; cmd_lock_test "${1:-example}";; *) usage; exit 2;; esac ;;
-    config)  case "${1:-}" in print) shift; cmd_config_print ;; set) shift; cmd_config_set "$@" ;; *) usage; exit 2 ;; esac ;;
-    # Downloader
-    fetch)   case "${1:-}" in url) shift; cmd_fetch_url "$@" ;; list) shift; cmd_fetch_list "$@" ;; git) shift; cmd_fetch_git "$@" ;; *) usage; exit 2 ;; esac ;;
-    verify)  cmd_verify "$@" ;;
-    cache)   case "${1:-}" in ls) shift; cmd_cache_ls "${1:-all}" ;; clean) shift; cmd_cache_clean "${1:-all}" ;; *) usage; exit 2 ;; esac ;;
-    # Chroot
-    chroot)  case "${1:-}" in init) shift; cmd_chroot_init ;; mount) shift; cmd_chroot_mount ;; umount) shift; cmd_chroot_umount ;; status) shift; cmd_chroot_status ;; enter) shift; cmd_chroot_enter "$@" ;; exec) shift; cmd_chroot_exec "$@" ;; *) usage; exit 2 ;; esac ;;
-    destdir) case "${1:-}" in run) shift; cmd_destdir_run "$@" ;; *) usage; exit 2 ;; esac ;;
-    # Receitas & Build
-    recipe)  case "${1:-}" in path) shift; cmd_recipe_path "$@" ;; print) shift; cmd_recipe_print "$@" ;; lint) shift; cmd_recipe_lint "$@" ;; *) usage; exit 2 ;; esac ;;
-    deps)    case "${1:-}" in graph) shift; cmd_deps_graph "$@" ;; tree) shift; cmd_deps_tree "$@" ;; *) usage; exit 2 ;; esac ;;
-    build)   case "${1:-}" in list) shift; cmd_build_list "$@" ;; *) cmd_build_one "${cmd}" "$@";; esac ;;  # Nota: "build <name>" captura aqui
+
+    config)
+      case "${1:-}" in
+        print) shift; cmd_config_print ;;
+        set)   shift; cmd_config_set "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    lock)
+      case "${1:-}" in
+        test) shift; cmd_lock_test "${1:-example}" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    # ----- Downloader / Cache -----
+    fetch)
+      case "${1:-}" in
+        url)  shift; cmd_fetch_url "$@" ;;
+        list) shift; cmd_fetch_list "$@" ;;
+        git)  shift; cmd_fetch_git "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    verify) cmd_verify "$@" ;;
+    cache)
+      case "${1:-}" in
+        ls)    shift; cmd_cache_ls "${1:-all}" ;;
+        clean) shift; cmd_cache_clean "${1:-all}" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    # ----- Chroot / Destdir -----
+    chroot)
+      case "${1:-}" in
+        init)  shift; cmd_chroot_init ;;
+        mount) shift; cmd_chroot_mount ;;
+        umount) shift; cmd_chroot_umount ;;
+        status) shift; cmd_chroot_status ;;
+        enter) shift; cmd_chroot_enter "$@" ;;
+        exec)  shift; cmd_chroot_exec "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    destdir)
+      case "${1:-}" in
+        run) shift; cmd_destdir_run "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    # ----- Receitas / Deps / Build -----
+    recipe)
+      case "${1:-}" in
+        path)  shift; cmd_recipe_path "$@" ;;
+        print) shift; cmd_recipe_print "$@" ;;
+        lint)  shift; cmd_recipe_lint "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    deps)
+      case "${1:-}" in
+        graph) shift; cmd_deps_graph "$@" ;;
+        tree)  shift; cmd_deps_tree "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    build)
+      case "${1:-}" in
+        list) shift; cmd_build_list "$@" ;;
+        *) cmd_build_one "$@" ;;
+      esac
+      ;;
+
+    # ----- Pacotes -----
+    pkg)
+      case "${1:-}" in
+        create) shift; cmd_pkg_create "$@" ;;
+        install) shift; cmd_pkg_install "$@" ;;
+        uninstall) shift; cmd_pkg_uninstall "$@" ;;
+        upgrade) shift; cmd_pkg_upgrade "$@" ;;
+        info) shift; cmd_pkg_info "$@" ;;
+        files) shift; cmd_pkg_files "$@" ;;
+        verify) shift; cmd_pkg_verify "$@" ;;
+        list) shift; cmd_pkg_list "$@" ;;
+        gc) shift; cmd_pkg_gc "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    # ----- Rebuild / Checks / ABI / ENV -----
+    rebuild)
+      case "${1:-}" in
+        plan)
+          case "${2:-}" in
+            world) shift 2; cmd_rebuild_plan_world ;;
+            changed) shift 2; cmd_rebuild_plan_changed "$@" ;;
+            intelligent) shift 2; cmd_rebuild_plan_intelligent ;;
+            *) usage; exit 2 ;;
+          esac
+          ;;
+        run) shift; cmd_rebuild_run "$@" ;;
+        save-toolchain-fp) shift; cmd_rebuild_save_toolfp ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    check)
+      case "${1:-}" in
+        cycles) shift; cmd_check_cycles "${1:-installed}" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    abi)
+      case "${1:-}" in
+        fp) shift; cmd_abi_fp "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    env)
+      case "${1:-}" in
+        fp) shift; cmd_env_fp ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    # ----- Upgrade / Rollback / Delta / History -----
+    upgrade)
+      case "${1:-}" in
+        smart) shift; cmd_upgrade_smart "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    rollback)
+      shift; cmd_rollback "$@" ;;
+    delta)
+      case "${1:-}" in
+        show) shift; cmd_delta_show "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    history)
+      shift; cmd_history "$@" ;;
+
+    # ----- Program (novo) -----
+    program)
+      case "${1:-}" in
+        search) shift; program_search "$@" ;;
+        info)   shift; program_info "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+
+    # ----- Atalhos redundantes (caso venham após 'lfsctl' e antes do comando principal) -----
+    --install)
+      [[ -n "${1:-}" ]] || die 2 "Uso: lfsctl --install <pacote.tar.zst>"
+      _handle_install_shortcut "$1"
+      ;;
+    -i)
+      [[ -n "${1:-}" ]] || die 2 "Uso: lfsctl -i <pacote.tar.zst>"
+      _handle_install_shortcut "$1"
+      ;;
+
+    # ----- Desconhecido -----
     *)
-      # Se usuário fizer "lfsctl build <name>" cai aqui: cmd é "build" já tratado acima,
-      # mas se digitar outro nome solto, erro:
-      log_error "Comando desconhecido: ${cmd}"
+      echo "Comando desconhecido: ${cmd}" >&2
       usage
       exit 2
       ;;
